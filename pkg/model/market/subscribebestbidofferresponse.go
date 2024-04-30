@@ -8,6 +8,7 @@ import (
 type SubscribeBestBidOfferResponse struct {
 	base.WebSocketResponseBase
 	Tick *struct {
+		SeqId     int64           `json:"seqId"`
 		QuoteTime int64           `json:"quoteTime"`
 		Symbol    string          `json:"symbol"`
 		Bid       decimal.Decimal `json:"bid"`
