@@ -10,7 +10,6 @@ import (
 	"github.com/huobirdcenter/huobi_golang/pkg/model/auth"
 	"github.com/huobirdcenter/huobi_golang/pkg/model/base"
 	"sync"
-	"time"
 )
 
 const (
@@ -29,20 +28,13 @@ type WebSocketV2ClientBase struct {
 	messageHandler                MessageHandler
 	responseHandler               ResponseHandler
 
-	stopReadChannel   chan int
-	stopTickerChannel chan int
-	ticker            *time.Ticker
-	lastReceivedTime  time.Time
-	sendMutex         *sync.Mutex
-
+	sendMutex      *sync.Mutex
 	requestBuilder *requestbuilder.WebSocketV2RequestBuilder
 }
 
 // Initializer
 func (p *WebSocketV2ClientBase) Init(accessKey string, secretKey string, host string) *WebSocketV2ClientBase {
 	p.host = host
-	p.stopReadChannel = make(chan int, 1)
-	p.stopTickerChannel = make(chan int, 1)
 	p.requestBuilder = new(requestbuilder.WebSocketV2RequestBuilder).Init(accessKey, secretKey, host, websocketV2Path)
 	p.sendMutex = &sync.Mutex{}
 	return p
@@ -57,17 +49,27 @@ func (p *WebSocketV2ClientBase) SetHandler(authHandler AuthenticationV2ResponseH
 
 // Connect to websocket server
 // if autoConnect is true, then the connection can be re-connect if no data received after the pre-defined timeout
-func (p *WebSocketV2ClientBase) Connect(autoConnect bool) {
-	// initialize last received time as now
-	p.lastReceivedTime = time.Now()
-
-	// connect to websocket
-	p.connectWebSocket()
-
-	// start ticker to manage connection
-	if autoConnect {
-		p.startTicker()
+func (p *WebSocketV2ClientBase) Connect(errHandler ErrHandler) (chan struct{}, error) {
+	var err error
+	url := fmt.Sprintf("wss://%s%s", p.host, websocketV2Path)
+	p.conn, _, err = websocket.DefaultDialer.Dial(url, nil)
+	if err != nil {
+		applogger.Error("WebSocket connected error: %s", err)
+		return nil, err
 	}
+	applogger.Info("WebSocket connected")
+
+	// start loop to read and handle message
+	doneC := p.startReadLoop(errHandler)
+
+	// send authentication if connect to websocket successfully
+	auth, err := p.requestBuilder.Build()
+	if err != nil {
+		applogger.Error("Signature generated error: %s", err)
+		return nil, err
+	}
+	p.Send(auth)
+	return doneC, nil
 }
 
 // Send data to websocket server
@@ -88,136 +90,27 @@ func (p *WebSocketV2ClientBase) Send(data string) {
 
 // Close the connection to server
 func (p *WebSocketV2ClientBase) Close() {
-	p.stopTicker()
-	p.disconnectWebSocket()
+	p.conn.Close()
 }
 
-// connect to server
-func (p *WebSocketV2ClientBase) connectWebSocket() {
-	var err error
-	url := fmt.Sprintf("wss://%s%s", p.host, websocketV2Path)
-	applogger.Debug("WebSocket connecting...")
-	p.conn, _, err = websocket.DefaultDialer.Dial(url, nil)
-	if err != nil {
-		applogger.Error("WebSocket connected error: %s", err)
-		return
-	}
-	applogger.Info("WebSocket connected")
-
-	// start loop to read and handle message
-	p.startReadLoop()
-
-	// send authentication if connect to websocket successfully
-	auth, err := p.requestBuilder.Build()
-	if err != nil {
-		applogger.Error("Signature generated error: %s", err)
-		return
-	}
-	p.Send(auth)
-	applogger.Info("WebSocket sent authentication")
-}
-
-// disconnect with server
-func (p *WebSocketV2ClientBase) disconnectWebSocket() {
-	if p.conn == nil {
-		return
-	}
-
-	// start a new goroutine to send stop signal
-	go p.stopReadLoop()
-
-	applogger.Debug("WebSocket disconnecting...")
-	err := p.conn.Close()
-	if err != nil {
-		applogger.Error("WebSocket disconnect error: %s", err)
-		return
-	}
-
-	applogger.Info("WebSocket disconnected")
-}
-
-// initialize a ticker and start a goroutine tickerLoop()
-func (p *WebSocketV2ClientBase) startTicker() {
-	p.ticker = time.NewTicker(TimerIntervalSecond * time.Second)
-
-	go p.tickerLoop()
-}
-
-// stop ticker and stop the goroutine
-func (p *WebSocketV2ClientBase) stopTicker() {
-	p.ticker.Stop()
-	p.stopTickerChannel <- 1
-}
-
-// defines a for loop that will run based on ticker's frequency
-// It checks the last data that received from server, if it is longer than the threshold,
-// it will force disconnect server and connect again.
-func (p *WebSocketV2ClientBase) tickerLoop() {
-	applogger.Debug("tickerLoop started")
-	for {
-		select {
-		// start a goroutine readLoop()
-		case <-p.stopTickerChannel:
-			applogger.Debug("tickerLoop stopped")
-			return
-
-		// Receive tick from tickChannel
-		case <-p.ticker.C:
-			elapsedSecond := time.Now().Sub(p.lastReceivedTime).Seconds()
-			applogger.Debug("WebSocket received data %f sec ago", elapsedSecond)
-
-			if elapsedSecond > ReconnectWaitSecond {
-				applogger.Info("WebSocket reconnect...")
-				p.disconnectWebSocket()
-				p.connectWebSocket()
-			}
-		}
-	}
-}
-
-// start a goroutine readLoop()
-func (p *WebSocketV2ClientBase) startReadLoop() {
-	go p.readLoop()
-}
-
-// stop the goroutine readLoop()
-func (p *WebSocketV2ClientBase) stopReadLoop() {
-	p.stopReadChannel <- 1
-}
-
-// defines a for loop to read data from server
-// it will stop once it receives the signal from stopReadChannel
-func (p *WebSocketV2ClientBase) readLoop() {
-	applogger.Debug("readLoop started")
-	for {
-		select {
-		// Receive data from stopChannel
-		case <-p.stopReadChannel:
-			applogger.Debug("readLoop stopped")
-			return
-
-		default:
-			if p.conn == nil {
-				applogger.Error("Read error: no connection available")
-				time.Sleep(TimerIntervalSecond * time.Second)
-				continue
-			}
-
+func (p *WebSocketV2ClientBase) startReadLoop(errHandler ErrHandler) (doneC chan struct{}) {
+	doneC = make(chan struct{})
+	go func() {
+		defer close(doneC)
+		defer p.Close()
+		for {
 			msgType, buf, err := p.conn.ReadMessage()
 			if err != nil {
-				applogger.Error("Read error: %s", err)
-				time.Sleep(TimerIntervalSecond * time.Second)
-				continue
+				errHandler(err)
+				return
 			}
-
-			p.lastReceivedTime = time.Now()
-
 			// decompress gzip data if it is binary message
 			var message string
 			if msgType == websocket.BinaryMessage {
 				message, err = gzip.GZipDecompress(buf)
 				if err != nil {
 					applogger.Error("UnGZip data error: %s", err)
+					errHandler(err)
 					return
 				}
 			} else if msgType == websocket.TextMessage {
@@ -259,5 +152,6 @@ func (p *WebSocketV2ClientBase) readLoop() {
 				}
 			}
 		}
-	}
+	}()
+	return
 }
